@@ -12,8 +12,8 @@
 
 import
   std/[sequtils, sets, algorithm],
-  stew/[results, byteutils], chronicles, chronos, nimcrypto/hash, bearssl,
-  ssz_serialization, metrics,
+  stew/[results, byteutils, leb128], chronicles, chronos, nimcrypto/hash,
+  bearssl, ssz_serialization, metrics, faststreams,
   eth/rlp, eth/p2p/discoveryv5/[protocol, node, enr, routing_table, random2,
     nodes_verification, lru],
   ../../content_db,
@@ -418,8 +418,8 @@ proc messageHandler(protocol: TalkProtocol, request: seq[byte],
     @[]
 
 proc processContent(
-    stream: PortalStream, contentKeys: ContentKeysList, content: seq[byte])
-    {.gcsafe, raises: [Defect].}
+    stream: PortalStream, contentKeys: ContentKeysList,
+    content: seq[seq[byte]]) {.gcsafe, raises: [Defect].}
 
 proc fromLogRadius(T: type UInt256, logRadius: uint16): T =
   # Get the max value of the logRadius range
@@ -631,7 +631,7 @@ proc findContent*(p: PortalProtocol, dst: Node, contentKey: ByteList):
         # send a FIN and clean up the socket.
         socket.close()
 
-      if await readData.withTimeout(p.stream.readTimeout):
+      if await readData.withTimeout(p.stream.contentReadTimeout):
         let content = readData.read
         await socket.destroyWait()
         return ok(FoundContent(src: dst, kind: Content, content: content))
@@ -725,17 +725,26 @@ proc offer(p: PortalProtocol, o: OfferRequest):
         error = connectionResult.error
       return err("Error connecting uTP socket")
 
-    let clientSocket = connectionResult.get()
+    let socket = connectionResult.get()
+
+    template lenu32(x: untyped): untyped =
+      uint32(len(x))
 
     case o.kind
     of Direct:
       for i, b in m.contentKeys:
         if b:
-          let dataWritten = await clientSocket.write(o.contentList[i].content)
+          let content = o.contentList[i].content
+          var output = memoryOutput()
+
+          output.write(toBytes(content.lenu32, Leb128).toOpenArray())
+          output.write(content)
+
+          let dataWritten = await socket.write(output.getOutput)
           if dataWritten.isErr:
             debug "Error writing requested data", error = dataWritten.error
             # No point in trying to continue writing data
-            clientSocket.close()
+            socket.close()
             return err("Error writing requested data")
     of Database:
       for i, b in m.contentKeys:
@@ -745,16 +754,25 @@ proc offer(p: PortalProtocol, o: OfferRequest):
             let
               contentId = contentIdOpt.get()
               maybeContent = p.contentDB.get(contentId)
+
+            var output = memoryOutput()
             if maybeContent.isSome():
               let content = maybeContent.get()
-              let dataWritten = await clientSocket.write(content)
-              if dataWritten.isErr:
-                debug "Error writing requested data", error = dataWritten.error
-                # No point in trying to continue writing data
-                clientSocket.close()
-                return err("Error writing requested data")
 
-    await clientSocket.closeWait()
+              output.write(toBytes(content.lenu32, Leb128).toOpenArray())
+              output.write(content)
+            else:
+              # When data turns out missing, add a 0 size varint
+              output.write(toBytes(0'u8, Leb128).toOpenArray())
+
+            let dataWritten = await socket.write(output.getOutput)
+            if dataWritten.isErr:
+              debug "Error writing requested data", error = dataWritten.error
+              # No point in trying to continue writing data
+              socket.close()
+              return err("Error writing requested data")
+
+    await socket.closeWait()
     return ok()
   else:
     return err("No accept response")
@@ -1028,14 +1046,21 @@ proc queryRandom*(p: PortalProtocol): Future[seq[Node]] =
   p.query(NodeId.random(p.baseProtocol.rng[]))
 
 proc neighborhoodGossip*(
-    p: PortalProtocol, contentKeys: ContentKeysList, content: seq[byte])
+    p: PortalProtocol, contentKeys: ContentKeysList, content: seq[seq[byte]])
     {.async.} =
-  let
-    # for now only 1 item is considered
-    contentInfo = ContentInfo(contentKey: contentKeys[0], content: content)
-    contentList = List[ContentInfo, contentKeysLimit].init(@[contentInfo])
-    contentIdOpt = p.toContentId(contentInfo.contentKey)
+  if content.len() == 0:
+    return
 
+  var contentList = List[ContentInfo, contentKeysLimit].init(@[])
+  for i, contentItem in content:
+    let contentInfo =
+      ContentInfo(contentKey: contentKeys[i], content: contentItem)
+
+    discard contentList.add(contentInfo)
+
+  # Just taking the first content item as target id.
+  # TODO: come up with something better?
+  let contentIdOpt = p.toContentId(contentList[0].contentKey)
   if contentIdOpt.isNone():
     return
 
@@ -1144,31 +1169,30 @@ proc storeContent*(p: PortalProtocol, key: ContentId, content: openArray[byte]) 
       p.contentDB.put(key, content)
 
 proc processContent(
-    stream: PortalStream, contentKeys: ContentKeysList, content: seq[byte])
-    {.gcsafe, raises: [Defect].} =
+    stream: PortalStream, contentKeys: ContentKeysList,
+    content: seq[seq[byte]]) {.gcsafe, raises: [Defect].} =
   let p = getUserData[PortalProtocol](stream)
 
-  # TODO:
-  # - Implement a way to discern different content items (e.g. length prefixed)
-  # - Check amount of content items according to ContentKeysList
-  # - The above could also live in `PortalStream`
-  # For now we only consider 1 item being offered
-  if contentKeys.len() == 1:
-    let contentKey = contentKeys[0]
-    if p.validateContent(content, contentKey):
+  # content passed here can have less items then contentKeys, but not more.
+  for i, contentItem in content:
+    let contentKey = contentKeys[i]
+    if p.validateContent(contentItem, contentKey):
       let contentIdOpt = p.toContentId(contentKey)
       if contentIdOpt.isNone():
         return
 
       let contentId = contentIdOpt.get()
 
-      p.storeContent(contentId, content)
+      p.storeContent(contentId, contentItem)
 
       info "Received valid offered content", contentKey
-
-      asyncSpawn neighborhoodGossip(p, contentKeys, content)
     else:
       error "Received invalid offered content", contentKey
+      # On one invalid piece of content we drop all and don't forward any of it
+      # TODO: Could also filter it out and still gossip the rest.
+      return
+
+  asyncSpawn neighborhoodGossip(p, contentKeys, content)
 
 proc seedTable*(p: PortalProtocol) =
   ## Seed the table with specifically provided Portal bootstrap nodes. These are

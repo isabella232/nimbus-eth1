@@ -146,7 +146,7 @@ proc populateHistoryDb*(
   for b in blocks(blockData, verify):
     for value in b:
       # Note: This is the slowest part due to the hashing that takes place.
-      # TODO use put method which preserves size 
+      # TODO use put method which preserves size
       db.put(history_content.toContentId(value[0]), value[1])
 
   ok()
@@ -165,7 +165,7 @@ proc propagateHistoryDb*(
     while true:
       let (keys, content) = await gossipQueue.popFirst()
 
-      await p.neighborhoodGossip(keys, content)
+      await p.neighborhoodGossip(keys, @[content])
 
   for i in 0 ..< concurrentGossips:
     gossipWorkers.add(gossipWorker(p))
@@ -212,7 +212,7 @@ proc propagateBlockHistoryDb*(
       if p.inRange(contentId):
         p.contentDB.put(contentId, value[1])
 
-      await p.neighborhoodGossip(ContentKeysList(@[encode(value[0])]), value[1])
+      await p.neighborhoodGossip(ContentKeysList(@[encode(value[0])]), @[value[1]])
 
     return ok()
   else:
